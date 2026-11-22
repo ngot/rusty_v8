@@ -1,4 +1,80 @@
-# Rusty V8 Binding
+# Rusty V8 Binding, coroutine fork
+
+> [!IMPORTANT]
+> This is [ngot/rusty_v8](https://github.com/ngot/rusty_v8), a fork of
+> [denoland/rusty_v8](https://github.com/denoland/rusty_v8) whose V8 lets
+> stackful coroutines share one isolate. Branch `coroutine` is upstream at a
+> release tag plus one V8 patch; `main` stays a plain mirror of upstream.
+> Everything below the line is upstream's README.
+
+## What the fork adds
+
+Stock V8 keeps its per-thread state in C++ `thread_local`s, so two stackful
+coroutines that share one OS thread and one isolate corrupt each other. The
+fork's `coroutine/coroutine-local.patch` keeps that state in a slot table per
+coroutine instead, which lets many coroutines run on one shared isolate, each
+suspending in native code and resuming in any order.
+
+| Addition | What it gives |
+| --- | --- |
+| Coroutine-local `thread_local`s | `v8_coroutine_slots_init` and `v8_coroutine_slots_use` give each coroutine stack its own V8 thread state |
+| Interrupts across a switch | A pending interrupt stays with the isolate for the next coroutine; a termination stays with the coroutine it hit |
+| Microtask ownership | `v8_coroutine_microtask_*` tag each queued microtask with an owner and move one job at a time to another queue, so each coroutine runs its own microtasks |
+| Object shapes | `v8_object_shape_*` build many objects with one fast-property layout, which the public API cannot express |
+| Trace events | `v8_trace_*` record V8's own trace events through libplatform's controller |
+| Typed arrays on the heap | `.gn` sets `v8_typed_array_max_size_in_heap = 64` (upstream: 0), as V8 and Chrome do |
+| `v8_coroutine_patch_version()` | The patch version, so a binding refuses to run on an archive it does not match |
+
+## Using it
+
+Most embedders want the safe crates in
+[ngot/v8_coroutine_rust](https://github.com/ngot/v8_coroutine_rust):
+`v8-coroutine-sys` re-exports this `v8` with bindings for every export above,
+and `v8-coroutine` runs coroutines on a shared isolate on top of it, with the
+rules that keep it sound (finish a coroutine before dropping it, suspend only
+through `v8::Unlocker`, never let a panic unwind through V8 frames). Both
+already point their build at this fork's release.
+
+To use the archive directly, each `v<rusty_v8 version>-coroutine.<n>` tag
+publishes tested archives for Linux x64 and arm64, macOS Apple Silicon and
+Windows x64. Keep depending on the crates.io `v8` crate at that version, and
+point its build script at the release, for example in `.cargo/config.toml`:
+
+```toml
+[env]
+RUSTY_V8_MIRROR = "https://github.com/ngot/rusty_v8/releases/download"
+RUSTY_V8_MIRROR_TAG = "v152.2.0-coroutine.1"
+```
+
+Then use the coroutine slots around each coroutine's stack switch:
+
+```rust
+use std::os::raw::c_void;
+
+unsafe extern "C" {
+  fn v8_coroutine_slot_count() -> usize;
+  fn v8_coroutine_slots_init(slots: *mut usize, stack_base: *mut c_void, stack_limit: *mut c_void);
+  fn v8_coroutine_slots_use(slots: *mut usize);
+}
+
+// One table per coroutine stack, initialized once with that stack's base (its
+// highest address) and limit (its lowest).
+let mut slots = vec![0usize; unsafe { v8_coroutine_slot_count() }];
+unsafe { v8_coroutine_slots_init(slots.as_mut_ptr(), stack_base, stack_limit) };
+
+// Around every resume: select the coroutine's table, switch stacks, then select
+// the resumer's table again: null for the OS thread's own, or the outer
+// coroutine's for a nested resume, also when the coroutine panics.
+unsafe { v8_coroutine_slots_use(slots.as_mut_ptr()) };
+coroutine.resume(input); // its body holds a v8::Locker; it suspends inside a v8::Unlocker
+unsafe { v8_coroutine_slots_use(std::ptr::null_mut()) };
+```
+
+[`coroutine/README.md`](coroutine/README.md) covers releasing, the asset names
+and building locally, and [`coroutine/UPGRADE.md`](coroutine/UPGRADE.md) covers
+moving the patch to a new rusty_v8.
+
+---
 
 V8 Version: 15.2.124.1
 
