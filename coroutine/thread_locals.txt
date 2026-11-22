@@ -1,0 +1,40 @@
+# Every thread_local in V8 src/ at the pinned rusty_v8 version, from list-thread-locals.sh.
+# Format: <file>: <declaration><TAB><patched: why | ignored: why>. check-thread-locals.sh fails on any unlisted line.
+src/base/contextual.h: inline static thread_local Scope* top_ = nullptr;	ignored: ContextualVariable scopes are only opened by the compiler and Torque, which never call into JS, so no scope is live at a coroutine switch
+src/base/contextual.h: inline static thread_local VarType default_value_{default_args...};	ignored: same as top_; the only non-compiler user (StackAllocatedCheck) is never scoped in V8 and read only under ENABLE_SLOW_DCHECKS
+src/base/platform/platform.cc: static thread_local int id = GetCurrentThreadIdInternal();	ignored: OS thread id for logging and profiling; all coroutines share the OS thread, so the OS value is the right answer
+src/base/platform/platform.cc: thread_local void* thread_reserved_stack_limit = nullptr;	patched: lower bound of Isolate::IsOnCentralStack, which every GC and throw CHECKs; must be the coroutine's own stack
+src/base/platform/platform.cc: thread_local void* thread_stack_start = nullptr;	patched: each coroutine has its own stack; feeds the stack guard limit, IsOnCentralStack CHECK on every throw, and the GC stack scan segment
+src/codegen/assembler.cc: ExternalAssemblerBufferImpl) static thread_local char tls_singleton_storage	ignored: scratch assembler buffer used within one code generation; codegen never calls into JS
+src/codegen/assembler.cc: static thread_local bool tls_singleton_taken{false};	ignored: same as tls_singleton_storage
+src/common/assert-scope.cc: thread_local PerThreadAsserts current_per_thread_assert_data(kInitialValue);	patched: per-thread assert scopes, read in release by CHECK(AllowHeapAllocationInRelease::IsAllowed()) and written by public no-GC API scopes
+src/common/ptr-compr.cc: #define THREAD_LOCAL_IF_MULTICAGE thread_local	ignored: only with V8_COMPRESS_POINTERS_IN_MULTIPLE_CAGES (off in this build); re-established by Isolate::Enter when on
+src/common/ptr-compr.h: static thread_local uintptr_t base_ V8_CONSTINIT;	ignored: same as THREAD_LOCAL_IF_MULTICAGE
+src/compiler/js-heap-broker.cc: static thread_local JSHeapBroker* current_broker = nullptr;	ignored: set only for the duration of one compilation job, which never calls into JS
+src/compiler/turboshaft/index.h: inline thread_local Block** current_assembler_block = nullptr;	ignored: Turboshaft graph building, never calls into JS
+src/d8/d8-test.cc: thread_local FastCApiObject kFastCApiObject;	ignored: d8 shell test code, not linked into rusty_v8
+src/d8/d8.cc: thread_local Worker* current_worker_ = nullptr;	ignored: d8 shell, not linked into rusty_v8
+src/execution/isolate.cc: thread_local Isolate::PerIsolateThreadData* g_current_per_isolate_thread_data_	patched: per-thread data of the entered isolate (minimum identity set)
+src/execution/isolate.cc: thread_local Isolate* g_current_isolate_ V8_CONSTINIT = nullptr;	patched: the entered isolate (minimum identity set)
+src/execution/isolate.h: __attribute__((tls_model(V8_TLS_MODEL))) extern thread_local Isolate*	patched: declaration of g_current_isolate_
+src/execution/isolate.h: extern thread_local Isolate::PerIsolateThreadData*	patched: declaration of g_current_per_isolate_thread_data_
+src/execution/thread-id.cc: thread_local int thread_id = 0;	patched: V8 thread identity; keys Locker ownership, archived ThreadLocalTop, handle scopes and stack guard (minimum identity set)
+src/handles/handles.h: inline static thread_local int number_of_handles_ = 0;	ignored: exists only under ENABLE_SLOW_DCHECKS
+src/heap/heap-verifier.cc: thread_local Tagged<HeapObject> pending_layout_change_object =	ignored: set and cleared within one object layout change, with no JS in between
+src/heap/heap-write-barrier.cc: thread_local MarkingBarrier* current_marking_barrier = nullptr;	ignored: rewritten by Isolate::Enter and Exit (SetIsolateThreadLocals); a coroutine always exits the isolate before suspending, so it is null at every switch
+src/heap/heap.cc: thread_local Address pending_layout_change_object_address = kNullAddress;	ignored: same as pending_layout_change_object
+src/heap/local-heap.cc: thread_local LocalHeap* g_current_local_heap_ V8_CONSTINIT = nullptr;	patched: current LocalHeap (minimum identity set)
+src/heap/local-heap.h: __attribute__((tls_model(V8_TLS_MODEL))) extern thread_local LocalHeap*	patched: declaration of g_current_local_heap_
+src/init/isolate-group.cc: thread_local IsolateGroup* IsolateGroup::current_ = nullptr;	ignored: only with multi-cage pointer compression (off); re-established by Isolate::Enter when on
+src/init/isolate-group.h: thread_local static IsolateGroup* current_;	ignored: declaration of IsolateGroup::current_
+src/logging/counters.cc: static thread_local std::unordered_map<const TimedHistogram*, bool>	ignored: exists only in DEBUG builds; patch it before shipping a debug V8
+src/maglev/maglev-graph-labeller.cc: thread_local MaglevGraphLabeller* thread_graph_labeller;	ignored: Maglev graph printing during compilation, never calls into JS
+src/maglev/maglev-graph-labeller.h: extern thread_local MaglevGraphLabeller* thread_graph_labeller;	ignored: declaration of thread_graph_labeller
+src/objects/string-inl.h: thread_local int recursion = 0;	ignored: fatal-error path only (TryReportUnreachable)
+src/sandbox/sandbox.cc: thread_local Sandbox* Sandbox::current_ = nullptr;	ignored: only with the V8 sandbox (off in this build); re-established by Isolate::Enter when on
+src/sandbox/sandbox.h: thread_local static Sandbox* current_;	ignored: declaration of Sandbox::current_
+src/trap-handler/handler-shared.cc: thread_local bool TrapHandlerGuard::is_active_ = 0;	ignored: true only while executing Wasm code; every call out of Wasm clears it, and a coroutine only suspends inside a JS-called native callback
+src/trap-handler/trap-handler-internal.h: static thread_local bool is_active_;	ignored: declaration of TrapHandlerGuard::is_active_
+src/wasm/wasm-code-manager.cc: thread_local WasmCodeRefScope* current_code_refs_scope = nullptr;	ignored: WasmCodeRefScope lives within one Wasm runtime or compile operation and is never open across a call into an embedder callback
+src/wasm/wasm-external-refs.cc: thread_local uintptr_t central_stack_limit = 0;	ignored: Windows only (#if V8_OS_WIN)
+src/wasm/wasm-tracing.cc: static thread_local base::LeakyObject<wasm::WasmTracesForTesting>	ignored: testing only

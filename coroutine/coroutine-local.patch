@@ -1,0 +1,1280 @@
+diff --git i/src/api/api.cc w/src/api/api.cc
+index 6298f80d..6583dde3 100644
+--- i/src/api/api.cc
++++ w/src/api/api.cc
+@@ -26,6 +26,7 @@
+ #include "include/v8-function.h"
+ #include "include/v8-json.h"
+ #include "include/v8-locker.h"
++#include "include/libplatform/v8-tracing.h"
+ #include "include/v8-platform.h"
+ #include "include/v8-primitive-object.h"
+ #include "include/v8-profiler.h"
+@@ -12742,6 +12743,347 @@ std::string SourceLocation::ToString() const {
+ 
+ }  // namespace v8
+ 
++// ---------------------------------------------------------------------------
++// Object shapes for embedders.
++//
++// A shape is a cached fast-property Map built from a chosen prototype (null
++// included) and a fixed list of property names, plus the field index of every
++// property. An object allocated from a shape needs no name hashing and no map
++// transition per property: the fill loop writes each value at its own field
++// index. That is the `putDirectOffset` path JSC gives Bun's SQLite rows, and
++// it is the one fast-object layout the public API cannot express, because
++// `Object.create(null)` normalises and `Object.setPrototypeOf` cannot hand out
++// the map it produces.
++//
++// An embedder owns a shape, may allocate any number of objects from it on the
++// isolate's thread, and must release it with v8_object_shape_release() before
++// the isolate is disposed. The V8 map is held through a Global handle of a
++// template object, so it survives every GC. No thread state is involved.
++//
++// These are the C entry points v8-coroutine-sys binds as its ObjectShape;
++// a handle here is the tagged pointer a v8::Local stores.
++
++namespace {
++
++namespace i = v8::internal;
++
++struct V8ObjectShape {
++  // Keeps the shape's Map, its descriptor array and its field types alive.
++  v8::Global<v8::Object> holder;
++  // One entry per name, in the order the names were given.
++  std::vector<i::FieldIndex> fields;
++};
++
++inline v8::Local<v8::Value> ShapeValue(const void* handle) {
++  return *reinterpret_cast<const v8::Local<v8::Value>*>(&handle);
++}
++
++inline v8::Local<v8::String> ShapeString(const void* handle) {
++  return *reinterpret_cast<const v8::Local<v8::String>*>(&handle);
++}
++
++}  // namespace
++
++extern "C" {
++
++// Builds a shape, or returns null when the names cannot be a fast map: no
++// names, 128 names or more (V8's map cache boundary), an array-index name, a
++// repeated name, or a field that would not fit in the object body.
++void* v8_object_shape_new(void* v8_isolate, const void* prototype_or_null,
++                          const void* const* names, size_t count) {
++  auto* isolate = static_cast<v8::Isolate*>(v8_isolate);
++  auto* isolate_internal = reinterpret_cast<i::Isolate*>(isolate);
++  if (count == 0 ||
++      count >= static_cast<size_t>(i::JSObject::kMapCacheSize)) {
++    return nullptr;
++  }
++
++  std::vector<i::FieldIndex> fields;
++  fields.reserve(count);
++
++  v8::HandleScope scope(isolate);
++
++  // The map cache's map has `count` in-object slots; the copy is private to
++  // this shape, so the prototype and the fields below cannot affect literals.
++  i::Handle<i::Map> cached =
++      isolate_internal->factory()->ObjectLiteralMapFromCache(
++          isolate_internal->native_context(), static_cast<int>(count));
++  if (cached->is_dictionary_map()) return nullptr;
++  i::Handle<i::Map> map = i::Map::CopyInitialMap(
++      isolate_internal, cached, cached->instance_size(),
++      cached->GetInObjectProperties(), cached->UnusedPropertyFields());
++  // A shape map never shrinks its in-object area after allocations.
++  map->set_construction_counter(i::Map::kNoSlackTracking);
++
++  i::DirectHandle<i::JSPrototype> prototype;
++  if (prototype_or_null == nullptr) {
++    if (!i::TryCast(i::direct_handle(
++                        i::ReadOnlyRoots(isolate_internal).null_value(),
++                        isolate_internal),
++                    &prototype)) {
++      return nullptr;
++    }
++  } else if (!i::TryCast(
++                 v8::Utils::OpenDirectHandle(*ShapeValue(prototype_or_null)),
++                 &prototype)) {
++    return nullptr;
++  }
++  i::Map::SetPrototype(isolate_internal, map, prototype);
++
++  for (size_t k = 0; k < count; k++) {
++    i::DirectHandle<i::String> name =
++        isolate_internal->factory()->InternalizeString(
++            v8::Utils::OpenDirectHandle(*ShapeString(names[k])));
++    uint32_t index;
++    if (name->AsArrayIndex(&index)) return nullptr;
++    if (map->instance_descriptors()
++            ->Search(*name, map->NumberOfOwnDescriptors())
++            .is_found()) {
++      return nullptr;
++    }
++    i::MaybeHandle<i::Map> next = i::Map::CopyWithField(
++        isolate_internal, map, name, i::FieldType::Any(isolate_internal),
++        i::NONE, i::PropertyConstness::kMutable, i::Representation::Tagged(),
++        i::OMIT_TRANSITION);
++    if (!next.ToHandle(&map)) return nullptr;
++    i::FieldIndex field = i::FieldIndex::ForDescriptor(
++        *map, i::InternalIndex(map->NumberOfOwnDescriptors() - 1));
++    // Without an in-object slot the object would need a property array that
++    // NewJSObjectFromMap does not allocate.
++    if (!field.is_inobject()) return nullptr;
++    fields.push_back(field);
++  }
++
++  auto* shape = new V8ObjectShape();
++  shape->holder.Reset(
++      isolate,
++      v8::Utils::ToLocal(isolate_internal->factory()->NewJSObjectFromMap(map)));
++  shape->fields = std::move(fields);
++  return shape;
++}
++
++void v8_object_shape_release(void* shape) {
++  delete static_cast<V8ObjectShape*>(shape);
++}
++
++size_t v8_object_shape_field_count(const void* shape) {
++  return static_cast<const V8ObjectShape*>(shape)->fields.size();
++}
++
++// Bulk form: builds `rows` objects in one call from a cell plan, which is the
++// shape a table reader produces: one kind byte per cell in row-major order
++// (0 = null, 1 = a number from `numbers`, 2 = the next handle from `values`),
++// one field index per column in `fields`, and the numbers and handles those
++// kinds name. Returns the array of rows, or null when the sizes disagree.
++//
++// The loop runs here rather than in the embedder because a per-row call would
++// put one handle per row in the caller's scope, and every scavenge then walks
++// them; this function keeps a handle scope per chunk of rows, so the only roots
++// are the array and the objects already in it.
++const void* v8_object_shape_new_objects(void* v8_isolate,
++                                        const void* shape_ptr,
++                                        const uint32_t* fields,
++                                        size_t columns, const uint8_t* kinds,
++                                        const double* numbers,
++                                        const void* const* values,
++                                        size_t value_count, size_t rows) {
++  auto* isolate = static_cast<v8::Isolate*>(v8_isolate);
++  auto* isolate_internal = reinterpret_cast<i::Isolate*>(isolate);
++  auto* shape = static_cast<const V8ObjectShape*>(shape_ptr);
++  if (columns == 0) return nullptr;
++  for (size_t column = 0; column < columns; column++) {
++    if (fields[column] >= shape->fields.size()) return nullptr;
++  }
++
++  i::DirectHandle<i::JSReceiver> holder = v8::Utils::OpenDirectHandle(
++      *shape->holder.Get(isolate));
++  i::DirectHandle<i::Map> map(
++      i::Cast<i::Map>(holder->map()), isolate_internal);
++  i::ReadOnlyRoots roots(isolate_internal);
++
++  v8::EscapableHandleScope scope(isolate);
++  if (rows == 0) return *scope.Escape(v8::Array::New(isolate, 0));
++  i::DirectHandle<i::FixedArray> elements =
++      isolate_internal->factory()->NewFixedArray(static_cast<int>(rows),
++                                                 i::AllocationType::kYoung);
++  size_t next_value = 0;
++  constexpr size_t kChunkRows = 4096;
++  for (size_t start = 0; start < rows; start += kChunkRows) {
++    v8::HandleScope chunk_scope(isolate);
++    size_t end = std::min(start + kChunkRows, rows);
++    for (size_t row = start; row < end; row++) {
++      i::DirectHandle<i::JSObject> object =
++          isolate_internal->factory()->NewJSObjectFromMap(map);
++      const size_t base = row * columns;
++      bool young = i::HeapLayout::InYoungGeneration(*object);
++      auto put = [&](i::FieldIndex field, i::Tagged<i::Object> value) {
++        if (young) {
++          object->RawFastInobjectPropertyAtPut(field, value,
++                                               i::SKIP_WRITE_BARRIER_SCOPE);
++        } else {
++          object->RawFastInobjectPropertyAtPut(field, value,
++                                               i::UPDATE_WRITE_BARRIER);
++        }
++      };
++      for (size_t column = 0; column < columns; column++) {
++        i::Tagged<i::Object> value;
++        switch (kinds[base + column]) {
++          case 0:
++            value = roots.null_value();
++            break;
++          case 1: {
++            double number = numbers[base + column];
++            int smi = 0;
++            if (i::DoubleToSmiInteger(number, &smi)) {
++              value = i::Smi::FromInt(smi);
++            } else {
++              value = *isolate_internal->factory()->NewNumber(number);
++              young = i::HeapLayout::InYoungGeneration(*object);
++            }
++            break;
++          }
++          default:
++            if (next_value >= value_count) return nullptr;
++            value = *v8::Utils::OpenDirectHandle(*ShapeValue(values[next_value]));
++            next_value++;
++            break;
++        }
++        put(shape->fields[fields[column]], value);
++      }
++      if (i::HeapLayout::InYoungGeneration(*elements)) {
++        elements->set(static_cast<int>(row), *object,
++                      i::SKIP_WRITE_BARRIER_SCOPE);
++      } else {
++        elements->set(static_cast<int>(row), *object, i::UPDATE_WRITE_BARRIER);
++      }
++    }
++  }
++  i::DirectHandle<i::JSArray> array =
++      isolate_internal->factory()->NewJSArrayWithElements(
++          elements, i::PACKED_ELEMENTS, static_cast<int>(rows));
++  return *scope.Escape(v8::Utils::ToLocal(array));
++}
++
++// Allocates one object from the shape and fills every field, or returns null
++// when `count` does not match the shape.
++const void* v8_object_shape_new_object(void* v8_isolate, const void* shape_ptr,
++                                       const void* const* values,
++                                       size_t count) {
++  auto* isolate = static_cast<v8::Isolate*>(v8_isolate);
++  auto* isolate_internal = reinterpret_cast<i::Isolate*>(isolate);
++  auto* shape = static_cast<const V8ObjectShape*>(shape_ptr);
++  if (count != shape->fields.size()) return nullptr;
++
++  i::DirectHandle<i::JSReceiver> holder = v8::Utils::OpenDirectHandle(
++      *shape->holder.Get(isolate));
++  i::DirectHandle<i::JSObject> object =
++      isolate_internal->factory()->NewJSObjectFromMap(
++          i::direct_handle(holder->map(), isolate_internal));
++  {
++    i::DisallowGarbageCollection no_gc;
++    for (size_t k = 0; k < count; k++) {
++      object->RawFastInobjectPropertyAtPut(
++          shape->fields[k],
++          *v8::Utils::OpenDirectHandle(*ShapeValue(values[k])),
++          i::UPDATE_WRITE_BARRIER);
++    }
++  }
++  return *v8::Utils::ToLocal(object);
++}
++
++}  // extern "C"
++
+ #ifdef ENABLE_SLOW_DCHECKS
+ EXPORT_CONTEXTUAL_VARIABLE(i::StackAllocatedCheck)
+ #endif
++
++// ---------------------------------------------------------------------------
++// V8's own trace events for an embedder's trace file.
++//
++// V8 emits TRACE_EVENT records (GC phases, compilation, execution) through the
++// platform's TracingController. A default platform's controller has no buffer,
++// so every category reads as disabled. These entry points give it a ring buffer
++// whose JSON writer appends to a string, start and stop recording a category
++// list, and hand the text back. The controller must be libplatform's, which is
++// what v8::platform::NewDefaultPlatform creates. v8-coroutine-sys binds them
++// as its trace module.
++
++namespace {
++
++struct V8TraceState {
++  std::ostringstream out;
++  v8::platform::tracing::TraceBuffer* buffer = nullptr;
++  std::string taken;
++};
++
++V8TraceState* TraceState() {
++  static V8TraceState* state = new V8TraceState();
++  return state;
++}
++
++v8::platform::tracing::TracingController* TraceController() {
++  return static_cast<v8::platform::tracing::TracingController*>(
++      v8::internal::V8::GetCurrentPlatform()->GetTracingController());
++}
++
++}  // namespace
++
++extern "C" {
++
++// Records the given categories (replacing any earlier list). Returns 1 when
++// recording started, 0 when the platform has no libplatform controller.
++int v8_trace_start(const char* const* categories, size_t count) {
++  if (v8::internal::V8::GetCurrentPlatform() == nullptr) return 0;
++  auto* controller = TraceController();
++  if (controller == nullptr) return 0;
++  V8TraceState* state = TraceState();
++  if (state->buffer == nullptr) {
++    auto* writer =
++        v8::platform::tracing::TraceWriter::CreateJSONTraceWriter(state->out);
++    state->buffer =
++        v8::platform::tracing::TraceBuffer::CreateTraceBufferRingBuffer(
++            8192, writer);
++    // The controller owns the buffer for the rest of the process.
++    controller->Initialize(state->buffer);
++  }
++  auto* config = new v8::platform::tracing::TraceConfig();
++  config->SetTraceRecordMode(v8::platform::tracing::RECORD_CONTINUOUSLY);
++  for (size_t i = 0; i < count; i++) config->AddIncludedCategory(categories[i]);
++  controller->StartTracing(config);
++  return 1;
++}
++
++// V8's trace clock now, in microseconds: the timestamps of the events v8_trace_take returns.
++int64_t v8_trace_now_us() {
++  return v8::base::TimeTicks::Now().ToInternalValue();
++}
++
++// Stops recording; what was recorded stays for v8_trace_take.
++void v8_trace_stop() {
++  V8TraceState* state = TraceState();
++  if (state->buffer == nullptr) return;
++  TraceController()->StopTracing();
++}
++
++// Moves the events recorded so far into the string `*data` points at (valid
++// until the next call) as comma-separated JSON objects, and returns its
++// length. While recording, the buffer is flushed first.
++size_t v8_trace_take(const char** data) {
++  V8TraceState* state = TraceState();
++  if (state->buffer == nullptr) {
++    *data = "";
++    return 0;
++  }
++  state->buffer->Flush();
++  std::string text = state->out.str();
++  state->out.str("");
++  state->out.clear();
++  const std::string head = "{\"traceEvents\":[";
++  if (text.compare(0, head.size(), head) == 0) text.erase(0, head.size());
++  if (!text.empty() && text[0] == ',') text.erase(0, 1);
++  state->taken = std::move(text);
++  *data = state->taken.data();
++  return state->taken.size();
++}
++
++}  // extern "C"
+diff --git i/src/base/coroutine-local.h w/src/base/coroutine-local.h
+new file mode 100644
+index 00000000..01335413
+--- /dev/null
++++ w/src/base/coroutine-local.h
+@@ -0,0 +1,123 @@
++// Copyright 2026 the v8-coroutine authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// Per-coroutine storage for V8's thread state.
++//
++// An embedder may run many stackful coroutines on one OS thread, each holding
++// its own v8::Locker on a shared isolate. V8 identifies a thread's execution
++// state (Locker owner, archived ThreadLocalTop, handle scopes, stack guard,
++// stack bounds) through a few thread_locals; those are declared as
++// CoroutineLocal<T> instead. Each value lives in the slot table of the running
++// coroutine, which the embedder selects with v8_coroutine_slots_use().
++// A thread that is not running a coroutine uses its own table.
++
++#ifndef V8_BASE_COROUTINE_LOCAL_H_
++#define V8_BASE_COROUTINE_LOCAL_H_
++
++#include <stddef.h>
++#include <stdint.h>
++#include <string.h>
++
++#include <type_traits>
++
++#include "src/base/base-export.h"
++
++// Bumped whenever the table layout or the exported functions change.
++#define V8_COROUTINE_PATCH_VERSION 13
++
++namespace v8_coroutine {
++
++// Table index of each per-coroutine value. Every entry starts as zero except
++// kPerThreadAsserts, which must stay first (see ThreadTable()).
++enum CoroutineSlot : int {
++  kPerThreadAsserts,
++  kThreadId,
++  kCurrentIsolate,
++  kCurrentPerIsolateThreadData,
++  kCurrentLocalHeap,
++  kStackStart,
++  kReservedStackLimit,
++  kCoroutineSlotCount
++};
++
++// Initial value of kPerThreadAsserts: v8::internal's kInitialValue, checked by
++// a static_assert in src/common/assert-scope.cc.
++inline constexpr uintptr_t kInitialPerThreadAsserts = 0xFFFFFFDFu;
++
++#if defined(V8_TARGET_BIG_ENDIAN)
++#error "CoroutineLocal keeps values narrower than a slot in its low bytes"
++#endif
++
++// The running coroutine's table, or null on a plain thread.
++extern thread_local uintptr_t* g_active_coroutine_slots;
++
++// The calling thread's own table.
++V8_BASE_EXPORT uintptr_t* ThreadTable();
++
++inline uintptr_t* ActiveTable() {
++  uintptr_t* table = g_active_coroutine_slots;
++  return table ? table : ThreadTable();
++}
++
++// A value of type T kept per coroutine. Reads and writes copy the value; no
++// reference to the storage is handed out.
++template <typename T>
++class CoroutineLocal {
++  static_assert(sizeof(T) <= sizeof(uintptr_t));
++  static_assert(std::is_trivially_copyable_v<T>);
++
++ public:
++  explicit constexpr CoroutineLocal(CoroutineSlot slot) : slot_(slot) {}
++  CoroutineLocal(const CoroutineLocal&) = delete;
++  CoroutineLocal& operator=(const CoroutineLocal&) = delete;
++
++  T Get() const {
++    T value;
++    memcpy(&value, &ActiveTable()[slot_], sizeof(T));
++    return value;
++  }
++  void Set(T value) const { memcpy(&ActiveTable()[slot_], &value, sizeof(T)); }
++
++  operator T() const { return Get(); }
++  CoroutineLocal& operator=(T value) {
++    Set(value);
++    return *this;
++  }
++
++ private:
++  const CoroutineSlot slot_;
++};
++
++}  // namespace v8_coroutine
++
++extern "C" {
++// V8_COROUTINE_PATCH_VERSION of the V8 this was built from.
++V8_BASE_EXPORT int v8_coroutine_patch_version();
++// Number of slots in a coroutine's table.
++V8_BASE_EXPORT size_t v8_coroutine_slot_count();
++// Fills a new coroutine's table with the values a new thread starts with,
++// except the stack bounds: `stack_start` is the highest address of the
++// coroutine's stack, `stack_limit` its lowest (guard page included).
++V8_BASE_EXPORT void v8_coroutine_slots_init(uintptr_t* slots,
++                                                 void* stack_start,
++                                                 void* stack_limit);
++// Makes `slots` the running coroutine's table; null selects the thread's own.
++V8_BASE_EXPORT void v8_coroutine_slots_use(uintptr_t* slots);
++// Number of jobs in the isolate's default microtask queue.
++size_t v8_coroutine_microtask_count(void* isolate);
++// The owner of the default queue's first job (see v8_coroutine_microtask_owner):
++// 0 for none, -1 when the queue is empty.
++intptr_t v8_coroutine_microtask_peek(void* isolate);
++// Moves the default queue's first job to the end of `to` (a v8::MicrotaskQueue
++// of the same isolate) and returns 1. Returns 0 when the queue is empty or the
++// isolate is terminating, and -1 when `to` is not empty or is running.
++// `*owner` is the job's continuation preserved embedder data when that is a
++// Smi, else 0.
++int v8_coroutine_microtask_take(void* isolate, void* to, intptr_t* owner);
++// Sets the continuation preserved embedder data that new jobs capture: the Smi
++// `owner`, or undefined for 0. Values must fit in 31 bits.
++void v8_coroutine_microtask_owner(void* isolate, intptr_t owner);
++}
++
++#endif  // V8_BASE_COROUTINE_LOCAL_H_
+diff --git i/src/base/platform/platform.cc w/src/base/platform/platform.cc
+index a75d06db..d062e581 100644
+--- i/src/base/platform/platform.cc
++++ w/src/base/platform/platform.cc
+@@ -4,16 +4,51 @@
+ 
+ #include "src/base/platform/platform.h"
+ 
++#include "src/base/coroutine-local.h"
++
++namespace v8_coroutine {
++
++thread_local uintptr_t* g_active_coroutine_slots = nullptr;
++
++namespace {
++static_assert(kPerThreadAsserts == 0);
++thread_local uintptr_t thread_table[kCoroutineSlotCount] = {
++    kInitialPerThreadAsserts};
++}  // namespace
++
++uintptr_t* ThreadTable() { return thread_table; }
++
++}  // namespace v8_coroutine
++
++int v8_coroutine_patch_version() {
++  return V8_COROUTINE_PATCH_VERSION;
++}
++
++size_t v8_coroutine_slot_count() { return v8_coroutine::kCoroutineSlotCount; }
++
++void v8_coroutine_slots_init(uintptr_t* slots, void* stack_start,
++                                  void* stack_limit) {
++  for (int i = 0; i < v8_coroutine::kCoroutineSlotCount; i++) slots[i] = 0;
++  slots[v8_coroutine::kPerThreadAsserts] = v8_coroutine::kInitialPerThreadAsserts;
++  slots[v8_coroutine::kStackStart] = reinterpret_cast<uintptr_t>(stack_start);
++  slots[v8_coroutine::kReservedStackLimit] = reinterpret_cast<uintptr_t>(stack_limit);
++}
++
++void v8_coroutine_slots_use(uintptr_t* slots) {
++  v8_coroutine::g_active_coroutine_slots = slots;
++}
++
+ namespace v8 {
+ namespace base {
+ 
+ namespace {
+ 
+ // A pointer to current thread's stack beginning.
+-thread_local void* thread_stack_start = nullptr;
++constinit v8_coroutine::CoroutineLocal<void*> thread_stack_start(v8_coroutine::kStackStart);
+ 
+ // A pointer to current thread's reserved stack limit.
+-thread_local void* thread_reserved_stack_limit = nullptr;
++constinit v8_coroutine::CoroutineLocal<void*> thread_reserved_stack_limit(
++    v8_coroutine::kReservedStackLimit);
+ 
+ }  // namespace
+ 
+@@ -22,7 +57,7 @@ Stack::StackSlot Stack::GetStackStartUnchecked() {
+   if (!thread_stack_start) {
+     thread_stack_start = ObtainCurrentThreadStackStart();
+   }
+-  return thread_stack_start;
++  return thread_stack_start.Get();
+ }
+ 
+ // static
+@@ -30,7 +65,7 @@ Stack::StackSlot Stack::GetReservedStackLimit() {
+   if (!thread_reserved_stack_limit) {
+     thread_reserved_stack_limit = ObtainCurrentThreadStackReservedLimit();
+   }
+-  return thread_reserved_stack_limit;
++  return thread_reserved_stack_limit.Get();
+ }
+ 
+ // static
+diff --git i/src/codegen/compilation-cache.cc w/src/codegen/compilation-cache.cc
+index d4a23d14..c15df587 100644
+--- i/src/codegen/compilation-cache.cc
++++ w/src/codegen/compilation-cache.cc
+@@ -95,13 +95,29 @@ void CompilationCacheEval::Age() {
+     Tagged<Object> key;
+     if (!table->ToKey(entry, &key)) continue;
+ 
+-    DCHECK(IsFixedArray(key));
+-    // The ageing mechanism for eval caches.
+-    Tagged<SharedFunctionInfo> info =
+-        Cast<SharedFunctionInfo>(table->PrimaryValueAt(entry));
+-    // Clear entries after Bytecode was flushed from SFI.
+-    if (!info->HasBytecodeArray()) {
+-      table->RemoveEntry(entry);
++    if (IsNumber(key)) {
++      // The ageing mechanism for the initial dummy entry in the eval cache.
++      // The 'key' is the hash represented as a Number. The 'value' is a smi
++      // counting down from kHashGenerations. On reaching zero, the entry is
++      // cleared.
++      static_assert(CompilationCacheTable::kHashGenerations);
++      const int new_count = Smi::ToInt(table->PrimaryValueAt(entry)) - 1;
++      if (new_count == 0) {
++        table->RemoveEntry(entry);
++      } else {
++        DCHECK_GT(new_count, 0);
++        table->SetPrimaryValueAt(entry, Smi::FromInt(new_count),
++                                 SKIP_WRITE_BARRIER);
++      }
++    } else {
++      DCHECK(IsFixedArray(key));
++      // The ageing mechanism for eval caches.
++      Tagged<SharedFunctionInfo> info =
++          Cast<SharedFunctionInfo>(table->PrimaryValueAt(entry));
++      // Clear entries after Bytecode was flushed from SFI.
++      if (!info->HasBytecodeArray()) {
++        table->RemoveEntry(entry);
++      }
+     }
+   }
+ }
+diff --git i/src/common/assert-scope.cc w/src/common/assert-scope.cc
+index 4c65c1a9..69f0cebd 100644
+--- i/src/common/assert-scope.cc
++++ w/src/common/assert-scope.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "src/common/assert-scope.h"
+ 
++#include "src/base/coroutine-local.h"
+ #include "src/base/enum-set.h"
+ #include "src/execution/isolate-inl.h"
+ 
+@@ -24,7 +25,9 @@ constexpr PerThreadAsserts kClearedValue = PerThreadAsserts{};
+ static_assert(!kClearedValue.contains(ASSERT_TYPE_IS_VALID_MARKER));
+ 
+ // Thread-local storage for assert data.
+-thread_local PerThreadAsserts current_per_thread_assert_data(kInitialValue);
++static_assert(kInitialValue.ToIntegral() == v8_coroutine::kInitialPerThreadAsserts);
++constinit v8_coroutine::CoroutineLocal<PerThreadAsserts> current_per_thread_assert_data(
++    v8_coroutine::kPerThreadAsserts);
+ 
+ }  // namespace
+ 
+@@ -57,7 +60,7 @@ void PerThreadAssertScope<kAllow, kTypes...>::Release() {
+ // static
+ template <bool kAllow, PerThreadAssertType... kTypes>
+ bool PerThreadAssertScope<kAllow, kTypes...>::IsAllowed() {
+-  return current_per_thread_assert_data.contains_all({kTypes...});
++  return current_per_thread_assert_data.Get().contains_all({kTypes...});
+ }
+ 
+ #define PER_ISOLATE_ASSERT_SCOPE_DEFINITION(ScopeType, field, enable)      \
+diff --git i/src/execution/isolate.cc w/src/execution/isolate.cc
+index c78eb192..58cfad6f 100644
+--- i/src/execution/isolate.cc
++++ w/src/execution/isolate.cc
+@@ -590,9 +590,10 @@ size_t Isolate::HashIsolateForEmbeddedBlob() {
+   return hash;
+ }
+ 
+-thread_local Isolate::PerIsolateThreadData* g_current_per_isolate_thread_data_
+-    V8_CONSTINIT = nullptr;
+-thread_local Isolate* g_current_isolate_ V8_CONSTINIT = nullptr;
++constinit v8_coroutine::CoroutineLocal<Isolate::PerIsolateThreadData*>
++    g_current_per_isolate_thread_data_(v8_coroutine::kCurrentPerIsolateThreadData);
++constinit v8_coroutine::CoroutineLocal<Isolate*> g_current_isolate_(
++    v8_coroutine::kCurrentIsolate);
+ 
+ V8_TLS_DEFINE_GETTER(Isolate::TryGetCurrent, Isolate*, g_current_isolate_)
+ 
+diff --git i/src/execution/isolate.h w/src/execution/isolate.h
+index 9c5cc6b6..19ab94a2 100644
+--- i/src/execution/isolate.h
++++ w/src/execution/isolate.h
+@@ -23,6 +23,7 @@
+ #include "include/v8-isolate.h"
+ #include "include/v8-metrics.h"
+ #include "include/v8-snapshot.h"
++#include "src/base/coroutine-local.h"
+ #include "src/base/macros.h"
+ #include "src/base/platform/mutex.h"
+ #include "src/base/platform/platform-posix.h"
+@@ -554,8 +555,7 @@ using DebugObjectCache = std::vector<Handle<HeapObject>>;
+ 
+ // Do not use this variable directly, use Isolate::Current() instead.
+ // Defined outside of Isolate because Isolate uses V8_EXPORT_PRIVATE.
+-__attribute__((tls_model(V8_TLS_MODEL))) extern thread_local Isolate*
+-    g_current_isolate_ V8_CONSTINIT;
++extern v8_coroutine::CoroutineLocal<Isolate*> g_current_isolate_;
+ 
+ // HiddenFactory exists so Isolate can privately inherit from it without making
+ // Factory's members available to Isolate directly.
+@@ -3065,8 +3065,8 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
+ // This is outside the Isolate class with extern storage because in clang-cl,
+ // thread_local is incompatible with dllexport linkage caused by
+ // V8_EXPORT_PRIVATE being applied to Isolate.
+-extern thread_local Isolate::PerIsolateThreadData*
+-    g_current_per_isolate_thread_data_ V8_CONSTINIT;
++extern v8_coroutine::CoroutineLocal<Isolate::PerIsolateThreadData*>
++    g_current_per_isolate_thread_data_;
+ 
+ #undef FIELD_ACCESSOR
+ #undef THREAD_LOCAL_TOP_ACCESSOR
+diff --git i/src/execution/microtask-queue.cc w/src/execution/microtask-queue.cc
+index db261fc8..7f8cb88f 100644
+--- i/src/execution/microtask-queue.cc
++++ w/src/execution/microtask-queue.cc
+@@ -15,6 +15,7 @@
+ #include <optional>
+ 
+ #include "src/api/api-inl.h"
++#include "src/base/coroutine-local.h"
+ #include "src/base/logging.h"
+ #include "src/execution/isolate.h"
+ #include "src/handles/handle-scope-implementer-inl.h"
+@@ -380,3 +381,67 @@ void MicrotaskQueue::ResizeBuffer(intptr_t new_capacity) {
+ 
+ }  // namespace internal
+ }  // namespace v8
++
++// Lets an embedder run a shared isolate's microtasks one job at a time, each on
++// the coroutine of its choice: a job that suspends then holds up no other job.
++
++namespace {
++
++intptr_t& QueueField(v8::internal::MicrotaskQueue* queue, size_t offset) {
++  return *reinterpret_cast<intptr_t*>(reinterpret_cast<uintptr_t>(queue) +
++                                      offset);
++}
++
++}  // namespace
++
++size_t v8_coroutine_microtask_count(void* v8_isolate) {
++  auto* isolate = reinterpret_cast<v8::internal::Isolate*>(v8_isolate);
++  return static_cast<size_t>(isolate->default_microtask_queue()->size());
++}
++
++intptr_t v8_coroutine_microtask_peek(void* v8_isolate) {
++  auto* isolate = reinterpret_cast<v8::internal::Isolate*>(v8_isolate);
++  v8::internal::MicrotaskQueue* queue = isolate->default_microtask_queue();
++  if (queue->size() == 0) return -1;
++#ifdef V8_ENABLE_CONTINUATION_PRESERVED_EMBEDDER_DATA
++  v8::internal::Tagged<v8::internal::Object> data =
++      queue->get(0)->continuation_preserved_embedder_data();
++  if (v8::internal::IsSmi(data)) return v8::internal::Smi::ToInt(data);
++#endif
++  return 0;
++}
++
++int v8_coroutine_microtask_take(void* v8_isolate, void* to, intptr_t* owner) {
++  using v8::internal::MicrotaskQueue;
++  auto* isolate = reinterpret_cast<v8::internal::Isolate*>(v8_isolate);
++  MicrotaskQueue* from = isolate->default_microtask_queue();
++  auto* target = static_cast<MicrotaskQueue*>(static_cast<v8::MicrotaskQueue*>(to));
++  // A job may only move into an idle, empty queue, and none runs once the
++  // isolate is terminating.
++  if (target->size() != 0 || target->IsRunningMicrotasks()) return -1;
++  if (from->size() == 0 || isolate->is_execution_terminating()) return 0;
++  v8::internal::Tagged<v8::internal::Microtask> job = from->get(0);
++  QueueField(from, MicrotaskQueue::kStartOffset) =
++      (from->start() + 1) % from->capacity();
++  QueueField(from, MicrotaskQueue::kSizeOffset) = from->size() - 1;
++  target->EnqueueMicrotask(job);
++  *owner = 0;
++#ifdef V8_ENABLE_CONTINUATION_PRESERVED_EMBEDDER_DATA
++  v8::internal::Tagged<v8::internal::Object> data =
++      job->continuation_preserved_embedder_data();
++  if (v8::internal::IsSmi(data)) *owner = v8::internal::Smi::ToInt(data);
++#endif
++  return 1;
++}
++
++void v8_coroutine_microtask_owner(void* v8_isolate, intptr_t owner) {
++#ifdef V8_ENABLE_CONTINUATION_PRESERVED_EMBEDDER_DATA
++  auto* isolate = reinterpret_cast<v8::internal::Isolate*>(v8_isolate);
++  v8::internal::Tagged<v8::internal::Object> data =
++      owner == 0 ? v8::internal::Tagged<v8::internal::Object>(
++                       v8::internal::ReadOnlyRoots(isolate).undefined_value())
++                 : v8::internal::Tagged<v8::internal::Object>(
++                       v8::internal::Smi::FromInt(static_cast<int>(owner)));
++  isolate->isolate_data()->set_continuation_preserved_embedder_data(data);
++#endif
++}
+diff --git i/src/execution/stack-guard.cc w/src/execution/stack-guard.cc
+index 33f0a514..69181881 100644
+--- i/src/execution/stack-guard.cc
++++ w/src/execution/stack-guard.cc
+@@ -225,16 +225,32 @@ int StackGuard::FetchAndClearInterrupts(InterruptLevel level) {
+   return result;
+ }
+ 
++// v8-coroutine: coroutines switch V8 threads on every suspend, and stock V8 archives the pending
++// interrupt flags with the thread that last ran, then restores (or initialises) the next thread's
++// state over them: a coroutine spinning in JS never saw an interrupt requested meanwhile. A flag
++// is a request of the isolate, so it now stays live across the archive and is requested again of
++// the state that comes in. Termination is the exception: an embedder aims it at the JS running
++// now, so a pending one stays with that thread, as before, and ends with it (FreeThreadResources).
++// A flag a PostponeInterruptsScope holds back still sits in that scope and moves with its thread.
+ char* StackGuard::ArchiveStackGuard(char* to) {
+   ExecutionAccess access(isolate_);
++  uint32_t pending = thread_local_.interrupt_flags_ & ~TERMINATE_EXECUTION;
++  thread_local_.interrupt_flags_ &= TERMINATE_EXECUTION;
++  update_interrupt_requests_and_stack_limits(access);
+   MemCopy(to, reinterpret_cast<char*>(&thread_local_), sizeof(ThreadLocal));
+   thread_local_ = {};
++  thread_local_.interrupt_flags_ = pending;
+   return to + sizeof(ThreadLocal);
+ }
+ 
+ char* StackGuard::RestoreStackGuard(char* from) {
+   ExecutionAccess access(isolate_);
++  uint32_t pending = thread_local_.interrupt_flags_;
+   MemCopy(reinterpret_cast<char*>(&thread_local_), from, sizeof(ThreadLocal));
++  // RequestInterrupt applies the restored thread's postpone scopes and limits.
++  for (uint32_t flag = 1; flag <= ALL_INTERRUPTS; flag <<= 1) {
++    if (pending & flag) RequestInterrupt(static_cast<InterruptFlag>(flag));
++  }
+   return from + sizeof(ThreadLocal);
+ }
+ 
+@@ -242,6 +258,10 @@ void StackGuard::FreeThreadResources() {
+   Isolate::PerIsolateThreadData* per_thread =
+       isolate_->FindOrAllocatePerThreadDataForThisThread();
+   per_thread->set_stack_limit(real_climit());
++  // v8-coroutine: the next thread inherits this live state, but not its termination.
++  ExecutionAccess access(isolate_);
++  thread_local_.interrupt_flags_ &= ~TERMINATE_EXECUTION;
++  update_interrupt_requests_and_stack_limits(access);
+ }
+ 
+ void StackGuard::ThreadLocal::Initialize(Isolate* isolate,
+@@ -260,6 +280,8 @@ void StackGuard::ThreadLocal::Initialize(Isolate* isolate,
+ }
+ 
+ void StackGuard::InitThread(const ExecutionAccess& lock) {
++  // v8-coroutine: keeps the flags pending for the isolate (see ArchiveStackGuard).
++  uint32_t pending = thread_local_.interrupt_flags_;
+   thread_local_.Initialize(isolate_, lock);
+   Isolate::PerIsolateThreadData* per_thread =
+       isolate_->FindOrAllocatePerThreadDataForThisThread();
+@@ -268,6 +290,9 @@ void StackGuard::InitThread(const ExecutionAccess& lock) {
+   if (stored_limit != 0) {
+     SetStackLimit(stored_limit);
+   }
++  for (uint32_t flag = 1; flag <= ALL_INTERRUPTS; flag <<= 1) {
++    if (pending & flag) RequestInterrupt(static_cast<InterruptFlag>(flag));
++  }
+ }
+ 
+ // --- C a l l s   t o   n a t i v e s ---
+diff --git i/src/execution/thread-id.cc w/src/execution/thread-id.cc
+index ec4e95ad..e58f85e3 100644
+--- i/src/execution/thread-id.cc
++++ w/src/execution/thread-id.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "src/execution/thread-id.h"
+ #include "src/base/lazy-instance.h"
++#include "src/base/coroutine-local.h"
+ #include "src/base/platform/platform.h"
+ 
+ namespace v8 {
+@@ -11,7 +12,7 @@ namespace internal {
+ 
+ namespace {
+ 
+-thread_local int thread_id = 0;
++constinit v8_coroutine::CoroutineLocal<int> thread_id(v8_coroutine::kThreadId);
+ 
+ std::atomic<int> next_thread_id{1};
+ 
+diff --git i/src/execution/v8threads.cc w/src/execution/v8threads.cc
+index bee14b71..b4a04724 100644
+--- i/src/execution/v8threads.cc
++++ w/src/execution/v8threads.cc
+@@ -47,6 +47,7 @@ void Locker::Initialize(v8::Isolate* isolate) {
+       top_level_ = false;
+     }
+   }
++  isolate_->thread_manager()->SetRunning(true);
+   DCHECK(isolate_->thread_manager()->IsLockedByCurrentThread());
+ }
+ 
+@@ -59,6 +60,7 @@ bool Locker::IsLocked(v8::Isolate* isolate) {
+ Locker::~Locker() {
+   DCHECK(isolate_->thread_manager()->IsLockedByCurrentThread());
+   if (has_lock_) {
++    isolate_->thread_manager()->SetRunning(false);
+     if (top_level_) {
+       isolate_->thread_manager()->FreeThreadResources();
+     } else {
+@@ -72,6 +74,7 @@ void Unlocker::Initialize(v8::Isolate* isolate) {
+   DCHECK_NOT_NULL(isolate);
+   isolate_ = reinterpret_cast<i::Isolate*>(isolate);
+   DCHECK(isolate_->thread_manager()->IsLockedByCurrentThread());
++  isolate_->thread_manager()->SetRunning(false);
+   isolate_->thread_manager()->ArchiveThread();
+   isolate_->thread_manager()->Unlock();
+ }
+@@ -80,6 +83,7 @@ Unlocker::~Unlocker() {
+   DCHECK(!isolate_->thread_manager()->IsLockedByCurrentThread());
+   isolate_->thread_manager()->Lock();
+   isolate_->thread_manager()->RestoreThread();
++  isolate_->thread_manager()->SetRunning(true);
+ }
+ 
+ namespace internal {
+@@ -219,6 +223,7 @@ ThreadState* ThreadState::Next() {
+ // defined as 0.)
+ ThreadManager::ThreadManager(Isolate* isolate)
+     : mutex_owner_(ThreadId::Invalid()),
++      running_os_thread_(kNoOsThread),
+       lazily_archived_thread_(ThreadId::Invalid()),
+       lazily_archived_thread_state_(nullptr),
+       free_anchor_(nullptr),
+diff --git i/src/execution/v8threads.h w/src/execution/v8threads.h
+index 69fb91f9..bb9c12bd 100644
+--- i/src/execution/v8threads.h
++++ w/src/execution/v8threads.h
+@@ -7,6 +7,7 @@
+ 
+ #include <atomic>
+ 
++#include "src/base/platform/platform.h"
+ #include "src/execution/isolate.h"
+ 
+ namespace v8 {
+@@ -79,6 +80,20 @@ class ThreadManager {
+ 
+   ThreadId CurrentId();
+ 
++  // Whether a V8 thread state is live under the lock on the given OS thread:
++  // set once a Locker or Unlocker has restored one, cleared before it is
++  // archived. Coroutines on one OS thread each have their own V8 thread
++  // identity, so the CPU sampler asks for the OS thread it profiles. It reads
++  // this from a signal handler (POSIX) or another thread (Windows): no lock.
++  bool IsRunningOn(int os_thread) const {
++    return running_os_thread_.load(std::memory_order_acquire) == os_thread;
++  }
++  void SetRunning(bool running) {
++    running_os_thread_.store(
++        running ? base::OS::GetCurrentThreadId() : kNoOsThread,
++        std::memory_order_release);
++  }
++
+   // Iterate over in-use states.
+   ThreadState* FirstThreadStateInUse();
+   ThreadState* GetFreeThreadState();
+@@ -95,6 +110,8 @@ class ThreadManager {
+   // {ThreadId} must be trivially copyable to be stored in {std::atomic}.
+   ASSERT_TRIVIALLY_COPYABLE(i::ThreadId);
+   std::atomic<ThreadId> mutex_owner_;
++  static constexpr int kNoOsThread = -1;
++  std::atomic<int> running_os_thread_;
+   ThreadId lazily_archived_thread_;
+   ThreadState* lazily_archived_thread_state_;
+ 
+diff --git i/src/heap/heap.cc w/src/heap/heap.cc
+index e9423f6d..4ba36e8e 100644
+--- i/src/heap/heap.cc
++++ w/src/heap/heap.cc
+@@ -1406,14 +1406,25 @@ Heap::DevToolsTraceEventScope::DevToolsTraceEventScope(Heap* heap,
+                                                        const char* event_name,
+                                                        const char* event_type)
+     : heap_(heap), event_name_(event_name) {
++#if defined(V8_USE_PERFETTO)
+   TRACE_EVENT_BEGIN("devtools.timeline,v8", perfetto::StaticString(event_name_),
+                     "usedHeapSizeBefore", heap_->SizeOfObjects(), "type",
+                     event_type);
++#else
++  TRACE_EVENT_BEGIN2("devtools.timeline,v8", event_name_, "usedHeapSizeBefore",
++                     static_cast<uint64_t>(heap_->SizeOfObjects()), "type",
++                     event_type);
++#endif
+ }
+ 
+ Heap::DevToolsTraceEventScope::~DevToolsTraceEventScope() {
++#if defined(V8_USE_PERFETTO)
+   TRACE_EVENT_END("devtools.timeline,v8", "usedHeapSizeAfter",
+                   heap_->SizeOfObjects());
++#else
++  TRACE_EVENT_END1("devtools.timeline,v8", event_name_, "usedHeapSizeAfter",
++                   static_cast<uint64_t>(heap_->SizeOfObjects()));
++#endif
+ }
+ 
+ namespace {
+@@ -1832,6 +1843,7 @@ void Heap::StartIncrementalMarking(GCFlags gc_flags,
+     return;
+   }
+ 
++#if defined(V8_USE_PERFETTO)
+   TRACE_EVENT(
+       "v8",
+       perfetto::StaticString(IsYoungGenerationCollector(collector)
+@@ -1853,6 +1865,7 @@ void Heap::StartIncrementalMarking(GCFlags gc_flags,
+         dict.Add("global_consumed_bytes", GlobalConsumedBytes());
+         dict.Add("global_space_available", GlobalSpaceAvailable());
+       });
++#endif  // V8_USE_PERFETTO: the lambda's commas would split macro arguments
+ 
+   if (IsYoungGenerationCollector(collector)) {
+     CompleteSweepingYoung(CompleteSweepingReason::kStartMinorMarking);
+@@ -7572,6 +7585,7 @@ void Heap::FinishSweepingIfOutOfWork(CompleteSweepingReason reason) {
+ 
+ void Heap::EnsureSweepingCompleted(SweepingForcedFinalizationMode mode,
+                                    CompleteSweepingReason reason) {
++#if defined(V8_USE_PERFETTO)
+   TRACE_GC_EPOCH(tracer(), GCTracer::Scope::HEAP_ENSURE_SWEEPING_COMPLETED,
+                  ThreadKind::kMain, "value", [&](perfetto::TracedValue ctx) {
+                    auto dict = std::move(ctx).WriteDictionary();
+@@ -7579,6 +7593,11 @@ void Heap::EnsureSweepingCompleted(SweepingForcedFinalizationMode mode,
+                    dict.Add("mode", ToString(mode));
+                    dict.Add("epoch", tracer()->CurrentEpoch());
+                  });
++#else
++  // The lambda needs perfetto's TracedValue.
++  TRACE_GC_EPOCH(tracer(), GCTracer::Scope::HEAP_ENSURE_SWEEPING_COMPLETED,
++                 ThreadKind::kMain);
++#endif
+ 
+   CompleteArrayBufferSweeping();
+ 
+diff --git i/src/heap/local-heap.cc w/src/heap/local-heap.cc
+index 10fb8796..d2af50b3 100644
+--- i/src/heap/local-heap.cc
++++ w/src/heap/local-heap.cc
+@@ -28,7 +28,8 @@
+ namespace v8 {
+ namespace internal {
+ 
+-thread_local LocalHeap* g_current_local_heap_ V8_CONSTINIT = nullptr;
++constinit v8_coroutine::CoroutineLocal<LocalHeap*> g_current_local_heap_(
++    v8_coroutine::kCurrentLocalHeap);
+ 
+ V8_TLS_DEFINE_GETTER(LocalHeap::TryGetCurrent, LocalHeap*,
+                      g_current_local_heap_)
+diff --git i/src/heap/local-heap.h w/src/heap/local-heap.h
+index f8ab0c6d..9e2dbabf 100644
+--- i/src/heap/local-heap.h
++++ w/src/heap/local-heap.h
+@@ -13,6 +13,7 @@
+ #endif
+ 
+ #include "src/base/logging.h"
++#include "src/base/coroutine-local.h"
+ #include "src/base/macros.h"
+ #include "src/base/platform/condition-variable.h"
+ #include "src/common/assert-scope.h"
+@@ -35,8 +36,7 @@ class Safepoint;
+ 
+ // Do not use this variable directly, use LocalHeap::Current() instead.
+ // Defined outside of LocalHeap because LocalHeap uses V8_EXPORT_PRIVATE.
+-__attribute__((tls_model(V8_TLS_MODEL))) extern thread_local LocalHeap*
+-    g_current_local_heap_ V8_CONSTINIT;
++extern v8_coroutine::CoroutineLocal<LocalHeap*> g_current_local_heap_;
+ 
+ // LocalHeap is used by the GC to track all threads with heap access in order to
+ // stop them before performing a collection. LocalHeaps can be either Parked or
+diff --git i/src/objects/compilation-cache-table-inl.h w/src/objects/compilation-cache-table-inl.h
+index 794788f5..d7606150 100644
+--- i/src/objects/compilation-cache-table-inl.h
++++ w/src/objects/compilation-cache-table-inl.h
+@@ -47,7 +47,8 @@ void CompilationCacheTable::SetEvalJSFunctionsValueAt(
+ // the Script. The corresponding value can be either the root SharedFunctionInfo
+ // or undefined. The purpose of storing the root SharedFunctionInfo as the value
+ // is to keep it alive, not to save a lookup on the Script. A newly added entry
+-// always contains the root SharedFunctionInfo. After the root
++// contains undefined; a second compile of the same source while its Script is
++// alive stores the root SharedFunctionInfo. After the root
+ // SharedFunctionInfo has aged sufficiently, it is replaced with undefined. In
+ // this way, all strong references to large objects are dropped, but there is
+ // still a way to get the Script if it happens to still be alive.
+diff --git i/src/objects/compilation-cache-table.cc w/src/objects/compilation-cache-table.cc
+index c9c117d0..40419733 100644
+--- i/src/objects/compilation-cache-table.cc
++++ w/src/objects/compilation-cache-table.cc
+@@ -126,6 +126,11 @@ class EvalCacheKey : public HashTableKey {
+ 
+   bool IsMatch(Tagged<Object> other) override {
+     DisallowGarbageCollection no_gc;
++    if (!IsFixedArray(other)) {
++      DCHECK(IsNumber(other));
++      uint32_t other_hash = static_cast<uint32_t>(Object::NumberValue(other));
++      return Hash() == other_hash;
++    }
+     Tagged<FixedArray> other_array = Cast<FixedArray>(other);
+     DCHECK(IsSharedFunctionInfo(other_array->get(0)));
+     if (*shared_ != other_array->get(0)) return false;
+@@ -517,7 +522,18 @@ DirectHandle<CompilationCacheTable> CompilationCacheTable::PutScript(
+   // 5. The merge from step 1 finishes on the main thread, still using S1, and
+   //    places S1 into the cache, replacing S2.
+   cache->SetKeyAt(entry, *k);
+-  cache->SetPrimaryValueAt(entry, *value);
++  // A new entry keeps only its weak key: the root SharedFunctionInfo is
++  // strong, and its bytecode is flushed only once it is --bytecode-old-time
++  // old by GCs V8 starts itself, so every one-shot script stayed that long
++  // and a burst of them filled a small heap. A compile of the same source
++  // while this Script is still alive finds the entry and stores its
++  // SharedFunctionInfo; once the Script dies, the next compile starts over.
++  if (found_existing) {
++    cache->SetPrimaryValueAt(entry, *value);
++  } else {
++    cache->SetPrimaryValueAt(entry,
++                             ReadOnlyRoots(isolate).undefined_value());
++  }
+   if (!found_existing) {
+     cache->ElementAdded();
+   }
+@@ -551,18 +567,34 @@ DirectHandle<CompilationCacheTable> CompilationCacheTable::PutEval(
+   EvalCacheKey key(src, outer_info, js_function->shared()->language_mode(),
+                    position);
+ 
++  // This block handles 'real' insertions, i.e. the initial dummy insert
++  // (below) has already happened earlier.
++  {
++    DirectHandle<Object> k = key.AsHandle(isolate);
++    InternalIndex entry = cache->FindEntry(isolate, &key);
++    if (entry.is_found()) {
++      cache->SetKeyAt(entry, *k);
++      if (cache->PrimaryValueAt(entry) != js_function->shared()) {
++        cache->SetPrimaryValueAt(entry, js_function->shared());
++        cache->SetEvalJSFunctionsValueAt(
++            entry, ReadOnlyRoots(isolate).the_hole_value());
++      }
++      // AddToJSFunctionMap may allocate a new sub-array to live in the
++      // entry, but it won't change the cache array. Therefore EntryToIndex
++      // and entry remains correct.
++      AddToJSFunctionMap(cache, entry, js_function);
++      // Add hash again even on cache hit to avoid unnecessary cache delay in
++      // case of hash collisions.
++    }
++  }
++
+   // Create a dummy entry to mark that this key has already been inserted once.
+   cache = EnsureCapacity(isolate, cache);
+   InternalIndex entry = cache->FindInsertionEntry(isolate, key.Hash());
+-  DirectHandle<Object> k = key.AsHandle(isolate);
++  DirectHandle<Object> k =
++      isolate->factory()->NewNumber(static_cast<double>(key.Hash()));
+   cache->SetKeyAt(entry, *k);
+-  cache->SetPrimaryValueAt(entry, js_function->shared());
+-  cache->SetEvalJSFunctionsValueAt(entry,
+-                                   ReadOnlyRoots(isolate).the_hole_value());
+-  // AddToFeedbackCellsMap may allocate a new sub-array to live in the
+-  // entry, but it won't change the cache array. Therefore EntryToIndex
+-  // and entry remains correct.
+-  AddToJSFunctionMap(cache, entry, js_function);
++  cache->SetPrimaryValueAt(entry, Smi::FromInt(kHashGenerations));
+   cache->ElementAdded();
+   return cache;
+ }
+diff --git i/src/profiler/cpu-profiler.cc w/src/profiler/cpu-profiler.cc
+index 5c3955fb..4b318a42 100644
+--- i/src/profiler/cpu-profiler.cc
++++ w/src/profiler/cpu-profiler.cc
+@@ -37,14 +37,16 @@ class CpuSampler : public sampler::Sampler {
+   CpuSampler(Isolate* isolate, SamplingEventsProcessor* processor)
+       : sampler::Sampler(reinterpret_cast<v8::Isolate*>(isolate)),
+         processor_(processor),
+-        perThreadData_(isolate->FindPerThreadDataForThisThread()) {}
++        profiled_os_thread_(base::OS::GetCurrentThreadId()) {}
+ 
+   void SampleStack(const v8::RegisterState& regs) override {
+     Isolate* isolate = reinterpret_cast<Isolate*>(this->isolate());
++    // Count a sample whenever any coroutine's state is live on the profiled
++    // thread, not only that of the coroutine that started the profiler. The
++    // sampler is built on the thread it profiles; on Windows this runs on the
++    // sampler's own thread, so ThreadId::Current() would name the wrong one.
+     if (isolate->was_locker_ever_used() &&
+-        (!isolate->thread_manager()->IsLockedByThread(
+-             perThreadData_->thread_id()) ||
+-         perThreadData_->thread_state() != nullptr)) {
++        !isolate->thread_manager()->IsRunningOn(profiled_os_thread_)) {
+       ProfilerStats::Instance()->AddReason(
+           ProfilerStats::Reason::kIsolateNotLocked);
+       return;
+@@ -69,7 +71,7 @@ class CpuSampler : public sampler::Sampler {
+ 
+  private:
+   SamplingEventsProcessor* processor_;
+-  Isolate::PerIsolateThreadData* perThreadData_;
++  const int profiled_os_thread_;
+ };
+ 
+ ProfilingScope::ProfilingScope(Isolate* isolate, ProfilerListener* listener)
+diff --git i/src/tracing/trace-event-no-perfetto.h w/src/tracing/trace-event-no-perfetto.h
+index 99e8cd98..9cdb305e 100644
+--- i/src/tracing/trace-event-no-perfetto.h
++++ w/src/tracing/trace-event-no-perfetto.h
+@@ -7,6 +7,7 @@
+ 
+ #include <cstdint>
+ #include <string>
++#include <type_traits>
+ 
+ namespace trace_event_internal {
+ 
+@@ -26,7 +27,28 @@ void Ignore(Args&&... args) {}
+ #define TRACE_EVENT_BEGIN(category, name, ...) \
+   INTERNAL_TRACE_IGNORE(category, name)
+ #define TRACE_EVENT_END(category, ...) INTERNAL_TRACE_IGNORE(category)
+-#define TRACE_EVENT(category, name, ...) INTERNAL_TRACE_IGNORE(category, name)
++// Embedders: a plain TRACE_EVENT with zero, one or two name/value argument pairs
++// becomes a legacy scoped event, so V8's own events (GC, deserialization,
++// deoptimization, compile) reach the embedder's TracingController as they do in
++// a Perfetto build. Other shapes (typed lambdas, flows, tracks) stay ignored.
++#define V8_TRACE_EVENT_PICK(_1, _2, _3, _4, _5, _6, _7, _8, NAME, ...) NAME
++#define V8_TRACE_EVENT_IGNORE(category, name, ...) \
++  INTERNAL_TRACE_IGNORE(category, name)
++#define V8_TRACE_EVENT_ARGS0(category, name) \
++  TRACE_EVENT0(category, static_cast<const char*>(name))
++#define V8_TRACE_EVENT_ARGS1(category, name, k1, v1) \
++  TRACE_EVENT1(category, static_cast<const char*>(name), k1,    \
++               v8::internal::tracing::TraceArg(v1))
++#define V8_TRACE_EVENT_ARGS2(category, name, k1, v1, k2, v2)           \
++  TRACE_EVENT2(category, static_cast<const char*>(name), k1,           \
++               v8::internal::tracing::TraceArg(v1), k2,                \
++               v8::internal::tracing::TraceArg(v2))
++#define TRACE_EVENT(category, name, ...)                                   \
++  V8_TRACE_EVENT_PICK(category, name, ##__VA_ARGS__, V8_TRACE_EVENT_IGNORE, \
++                      V8_TRACE_EVENT_IGNORE, V8_TRACE_EVENT_ARGS2,         \
++                      V8_TRACE_EVENT_IGNORE, V8_TRACE_EVENT_ARGS1,         \
++                      V8_TRACE_EVENT_IGNORE,                               \
++                      V8_TRACE_EVENT_ARGS0)(category, name, ##__VA_ARGS__)
+ #define TRACE_EVENT_INSTANT(category, name, ...) \
+   INTERNAL_TRACE_IGNORE(category, name)
+ #define TRACE_COUNTER(category, name, ...) INTERNAL_TRACE_IGNORE(category, name)
+@@ -40,13 +62,21 @@ class EventContext;
+ class StaticString {
+  public:
+   template <typename T>
+-  StaticString(T) {}
++  StaticString(T value) {
++    if constexpr (std::is_convertible_v<T, const char*>) str_ = value;
++  }
++  operator const char*() const { return str_; }
++
++ private:
++  const char* str_ = "unknown";
+ };
+ 
+ class DynamicString {
+  public:
+   template <typename T>
+   explicit DynamicString(T) {}
++  // The text is not kept: a legacy event needs a name that outlives it.
++  operator const char*() const { return "dynamic"; }
+ };
+ 
+ struct Track {
+diff --git i/src/tracing/trace-event.h w/src/tracing/trace-event.h
+index 6d9f10b2..7557a6c7 100644
+--- i/src/tracing/trace-event.h
++++ w/src/tracing/trace-event.h
+@@ -5,6 +5,8 @@
+ #ifndef V8_TRACING_TRACE_EVENT_H_
+ #define V8_TRACING_TRACE_EVENT_H_
+ 
++#include <string>
++#include <type_traits>
+ #include <stddef.h>
+ #include <memory>
+ 
+@@ -453,6 +455,29 @@ INTERNAL_DECLARE_SET_TRACE_VALUE(const TraceStringWithCopy&,
+                                  TRACE_VALUE_TYPE_COPY_STRING)
+ #undef INTERNAL_DECLARE_SET_TRACE_VALUE
+ 
++// Embedders: converts the value of a perfetto-style TRACE_EVENT argument to a type
++// the legacy tracing implementation can record.
++template <typename T>
++auto TraceArg(const T& value) {
++  using D = std::decay_t<T>;
++  if constexpr (std::is_same_v<D, bool> || std::is_floating_point_v<D>) {
++    return value;
++  } else if constexpr (std::is_enum_v<D>) {
++    return static_cast<int64_t>(value);
++  } else if constexpr (std::is_integral_v<D>) {
++    return static_cast<std::conditional_t<std::is_signed_v<D>, int64_t,
++                                          uint64_t>>(value);
++  } else if constexpr (std::is_convertible_v<D, const char*>) {
++    return static_cast<const char*>(value);
++  } else if constexpr (std::is_pointer_v<D>) {
++    return static_cast<const void*>(value);
++  } else if constexpr (std::is_convertible_v<D, std::string>) {
++    return TraceStringWithCopy(std::string(value).c_str());
++  } else {
++    return "unsupported";
++  }
++}
++
+ static V8_INLINE void SetTraceValue(ConvertableToTraceFormat* convertable_value,
+                                     unsigned char* type, uint64_t* value) {
+   *type = TRACE_VALUE_TYPE_CONVERTABLE;
