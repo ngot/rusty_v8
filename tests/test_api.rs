@@ -12255,8 +12255,10 @@ fn test_fast_calls_arraybuffer() {
   ) -> u32 {
     unsafe { WHO = "fast" };
     let data = data.cast::<v8::Uint32Array>();
-    let contents =
-      data.get_contents(&mut [0; v8::TYPED_ARRAY_MAX_SIZE_IN_HEAP]);
+    // A named buffer: with a nonzero size the array is a temporary, not a
+    // promoted constant, and `contents` may borrow it.
+    let mut buffer = [0; v8::TYPED_ARRAY_MAX_SIZE_IN_HEAP];
+    let contents = data.get_contents(&mut buffer);
     let (x, contents, y) = unsafe { contents.align_to::<u32>() };
     assert_eq!(x.len(), 0);
     assert_eq!(y.len(), 0);
@@ -12324,8 +12326,10 @@ fn test_fast_calls_typedarray() {
   fn fast_fn(_recv: v8::Local<v8::Object>, data: v8::Local<v8::Value>) -> u32 {
     unsafe { WHO = "fast" };
     let data = data.cast::<v8::Uint8Array>();
-    let contents =
-      data.get_contents(&mut [0; v8::TYPED_ARRAY_MAX_SIZE_IN_HEAP]);
+    // A named buffer: with a nonzero size the array is a temporary, not a
+    // promoted constant, and `contents` may borrow it.
+    let mut buffer = [0; v8::TYPED_ARRAY_MAX_SIZE_IN_HEAP];
+    let contents = data.get_contents(&mut buffer);
     let first = contents[0];
     let second = contents[1];
     let third = contents[2];
